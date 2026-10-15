@@ -360,6 +360,7 @@ def stream_followup_session(
                         f"/agents/sessions/{encoded_session_id}/events",
                         {"events": [{"type": "agent.session.input.message", "input": [{"role": "user", "content": [{"type": "input_text", "text": message}]}]}]},
                         extra_headers=["Idempotency-Key: " + uuid4().hex],
+                        allow_empty_response=True,
                     )
                     break
                 continue

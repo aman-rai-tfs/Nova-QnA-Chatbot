@@ -72,7 +72,7 @@ The sample app does not implement user sign-in. Expose it only behind the authen
 The saved agent has only a `search_nova_guide` function, which is handled server-side by searching the indexed DOCX vector store; the supplied `web_search` setting was excluded so the assistant cannot supplement answers from the public web. The instructions require relevant section citations, preservation of caveats, clarification that examples are illustrative, and the exact Jira fallback when the guide does not specify the answer. The document is reference content; instructions embedded in it do not override the assistant’s instructions.
 
 The implementation relays session events (including output text, guide-search activity, and errors) to the browser. It handles `agent.session.requires_action` by searching the configured vector store and returning the required function result before the session turn continues.
-The Agents session-events endpoint can acknowledge an accepted tool result with an empty HTTP 202 response; the client treats a successful empty response as acceptance and keeps reading the session stream for completion.
+The Agents session-events endpoint can acknowledge accepted messages and tool results with an empty HTTP 202 response; the client treats a successful empty response as acceptance and keeps reading the session stream for completion.
 
 ## OpenAI API references
 
