@@ -139,8 +139,10 @@
       catch { payload = { event: { type: "error", error: { message: data.join("\n") } } }; }
       if (name === "agent") updateFromEvent(payload, assistantMessage);
       else if (name === "error") updateFromEvent({ event_type: "error", event: payload }, assistantMessage);
-      else if (name === "done" && !assistantMessage.bubble.textContent && !assistantMessage.status.textContent) {
-        assistantMessage.status.textContent = "The turn ended without text output. Check the agent session in OpenAI Platform.";
+      else if (name === "done" && !assistantMessage.status.classList.contains("error")) {
+        assistantMessage.status.textContent = assistantMessage.bubble.textContent
+          ? ""
+          : "The turn ended without text output. Check the agent session in OpenAI Platform.";
       }
     }
 

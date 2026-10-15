@@ -153,6 +153,14 @@ def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
             event_name = line[6:].strip() or "message"
         elif line.startswith("data:"):
             data.append(line[5:].lstrip())
+        elif not data and line.startswith("{"):
+            # With --fail-with-body, curl can return a JSON API error instead of SSE.
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                on_event("error", payload)
         elif line == "" and data:
             raw = "\n".join(data)
             if raw != "[DONE]":
