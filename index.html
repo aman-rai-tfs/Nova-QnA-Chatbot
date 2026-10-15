@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Nova Deployment Guide Assistant</title>
+  <style>
+    :root { color-scheme: light; --ink: #18231f; --muted: #69766f; --line: #e3e9e5; --green: #176b4b; --green-dark: #10563b; --wash: #f4f8f5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: var(--wash); color: var(--ink); font: 15px/1.5 "Segoe UI", system-ui, sans-serif; }
+    .shell { min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
+    header { display: flex; align-items: center; justify-content: space-between; padding: 18px clamp(18px, 5vw, 64px); border-bottom: 1px solid var(--line); background: rgba(255,255,255,.92); }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 650; letter-spacing: -.02em; }
+    .mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; background: var(--green); color: #fff; font-size: 17px; }
+    .header-actions { display: flex; align-items: center; gap: 14px; }
+    .source { color: var(--muted); font-size: 13px; }
+    button { font: inherit; cursor: pointer; }
+    .new-chat { border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px; background: #fff; color: var(--ink); }
+    .new-chat:hover { border-color: #aab8b0; }
+    main { width: min(880px, 100%); margin: 0 auto; padding: 56px 22px 26px; display: flex; flex-direction: column; }
+    .intro { text-align: center; margin: 14px auto 38px; max-width: 650px; }
+    .eyebrow { color: var(--green); font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+    h1 { margin: 10px 0 10px; font-size: clamp(28px, 5vw, 42px); line-height: 1.14; letter-spacing: -.045em; }
+    .intro p { color: var(--muted); margin: 0; }
+    #messages { display: flex; flex-direction: column; gap: 18px; width: 100%; }
+    .message { display: flex; gap: 11px; align-items: flex-start; max-width: 88%; }
+    .message.user { align-self: flex-end; flex-direction: row-reverse; }
+    .avatar { flex: 0 0 30px; height: 30px; display: grid; place-items: center; border-radius: 10px; background: #e2eee7; color: var(--green); font-size: 12px; font-weight: 700; }
+    .user .avatar { background: #e9eaf2; color: #4b4a69; }
+    .bubble { padding: 12px 15px; border: 1px solid var(--line); border-radius: 4px 14px 14px 14px; background: #fff; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .user .bubble { border-color: #dce9e2; border-radius: 14px 4px 14px 14px; background: #eaf3ed; }
+    .status { color: var(--muted); font-size: 12px; margin: 8px 1px 0; }
+    .error { color: #a12d25; }
+    .composer-wrap { width: 100%; margin: auto auto 0; padding-top: 32px; }
+    .composer { display: flex; align-items: flex-end; gap: 10px; border: 1px solid #d8e2dc; border-radius: 15px; padding: 9px 9px 9px 16px; background: #fff; box-shadow: 0 8px 28px rgba(18, 54, 37, .055); }
+    textarea { width: 100%; min-height: 42px; max-height: 180px; padding: 9px 0; resize: vertical; border: 0; outline: 0; color: var(--ink); font: inherit; background: transparent; }
+    textarea::placeholder { color: #87938d; }
+    .send { flex: 0 0 auto; min-width: 76px; padding: 10px 14px; border: 0; border-radius: 10px; background: var(--green); color: #fff; font-weight: 650; }
+    .send:hover { background: var(--green-dark); }
+    .send:disabled { opacity: .56; cursor: wait; }
+    .hint { margin: 9px 6px 0; color: var(--muted); font-size: 12px; text-align: center; }
+    footer { padding: 12px 20px 18px; color: var(--muted); text-align: center; font-size: 12px; }
+    @media (max-width: 580px) { header { padding: 14px 16px; } .source { display: none; } main { padding-top: 35px; } .message { max-width: 100%; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand"><span class="mark" aria-hidden="true">N</span><span>Nova Guide Assistant</span></div>
+      <div class="header-actions"><span class="source">Answers grounded in the Nova Deployment Guide</span><button class="new-chat" id="newChat" type="button">New chat</button></div>
+    </header>
+    <main>
+      <section class="intro" id="intro">
+        <div class="eyebrow">Deployment knowledge</div>
+        <h1>What would you like to know about Nova?</h1>
+        <p>Ask a question about the deployment guide. Answers cite guide sections and call out caveats; anything the guide does not specify is directed to the current Nova/CPE Support process in Jira.</p>
+      </section>
+      <section id="messages" aria-live="polite" aria-label="Conversation"></section>
+      <div class="composer-wrap">
+        <form class="composer" id="chatForm">
+          <textarea id="messageInput" rows="1" maxlength="8000" placeholder="Ask a question about the deployment guide…" aria-label="Your question"></textarea>
+          <button class="send" id="sendButton" type="submit">Send</button>
+        </form>
+        <p class="hint">The assistant uses only the indexed guide. Examples in the guide are illustrative, not approved configurations.</p>
+      </div>
+    </main>
+    <footer>Nova Deployment Guide Assistant</footer>
+  </div>
+  <script>
+    const messages = document.getElementById("messages");
+    const form = document.getElementById("chatForm");
+    const input = document.getElementById("messageInput");
+    const sendButton = document.getElementById("sendButton");
+    const intro = document.getElementById("intro");
+    const sessionStorageKey = "nova-guide-session-id";
+    let sessionId = localStorage.getItem(sessionStorageKey) || "";
+
+    function addMessage(role, text = "") {
+      intro.hidden = true;
+      const row = document.createElement("article");
+      row.className = `message ${role}`;
+      const avatar = document.createElement("div");
+      avatar.className = "avatar";
+      avatar.textContent = role === "user" ? "You" : "N";
+      const wrap = document.createElement("div");
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = text;
+      const status = document.createElement("div");
+      status.className = "status";
+      wrap.append(bubble, status);
+      row.append(avatar, wrap);
+      messages.append(row);
+      row.scrollIntoView({ behavior: "smooth", block: "end" });
+      return { row, bubble, status };
+    }
+
+    function eventType(envelope) {
+      return envelope?.event?.type || envelope?.event_type || "message";
+    }
+
+    function updateFromEvent(envelope, assistantMessage) {
+      if (envelope.session_id) {
+        sessionId = envelope.session_id;
+        localStorage.setItem(sessionStorageKey, sessionId);
+      }
+      const event = envelope.event || {};
+      const type = eventType(envelope);
+      if (type.endsWith("output_text.delta") && typeof event.delta === "string") {
+        assistantMessage.bubble.textContent += event.delta;
+      } else if (type.endsWith("output_text.done") && typeof event.text === "string") {
+        assistantMessage.bubble.textContent = event.text;
+      } else if (type.endsWith("turn.failed") || type.endsWith("turn.cancelled") || type === "error") {
+        const detail = event.error?.message || event.message || "The agent could not complete this turn.";
+        assistantMessage.status.textContent = detail;
+        assistantMessage.status.classList.add("error");
+      } else if (type.includes("file_search") || type.includes("tool.call")) {
+        assistantMessage.status.textContent = "Searching the deployment guide…";
+      } else if (type.endsWith("turn.completed")) {
+        assistantMessage.status.textContent = "";
+      } else if (!assistantMessage.bubble.textContent && type.startsWith("agent.session")) {
+        assistantMessage.status.textContent = "Reviewing the guide…";
+      }
+      assistantMessage.row.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+
+    function dispatchSseBlock(block, assistantMessage) {
+      const lines = block.split(/\r?\n/);
+      let name = "message";
+      const data = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) name = line.slice(6).trim();
+        if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+      }
+      if (!data.length) return;
+      let payload;
+      try { payload = JSON.parse(data.join("\n")); }
+      catch { payload = { event: { type: "error", error: { message: data.join("\n") } } }; }
+      if (name === "agent") updateFromEvent(payload, assistantMessage);
+      else if (name === "error") updateFromEvent({ event_type: "error", event: payload }, assistantMessage);
+      else if (name === "done" && !assistantMessage.bubble.textContent && !assistantMessage.status.textContent) {
+        assistantMessage.status.textContent = "The turn ended without text output. Check the agent session in OpenAI Platform.";
+      }
+    }
+
+    async function sendMessage(text) {
+      const assistantMessage = addMessage("assistant");
+      sendButton.disabled = true;
+      input.disabled = true;
+      assistantMessage.status.textContent = "Connecting to the guide assistant…";
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text, session_id: sessionId || null })
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.error || `Request failed (${response.status}).`);
+        }
+        assistantMessage.status.textContent = "Reviewing the guide…";
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let separator;
+          while ((separator = buffer.search(/\r?\n\r?\n/)) !== -1) {
+            const block = buffer.slice(0, separator);
+            const match = buffer.slice(separator).match(/^\r?\n\r?\n/);
+            buffer = buffer.slice(separator + (match ? match[0].length : 2));
+            dispatchSseBlock(block, assistantMessage);
+          }
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) dispatchSseBlock(buffer, assistantMessage);
+        if (!assistantMessage.bubble.textContent && !assistantMessage.status.classList.contains("error")) {
+          assistantMessage.status.textContent ||= "No text response was received. Please try again.";
+        }
+      } catch (error) {
+        assistantMessage.status.textContent = error.message || "Something went wrong while contacting the assistant.";
+        assistantMessage.status.classList.add("error");
+      } finally {
+        sendButton.disabled = false;
+        input.disabled = false;
+        input.focus();
+      }
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (!text || sendButton.disabled) return;
+      addMessage("user", text);
+      input.value = "";
+      sendMessage(text);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+    document.getElementById("newChat").addEventListener("click", () => {
+      localStorage.removeItem(sessionStorageKey);
+      sessionId = "";
+      messages.replaceChildren();
+      intro.hidden = false;
+      input.focus();
+    });
+  </script>
+</body>
+</html>

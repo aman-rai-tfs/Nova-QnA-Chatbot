@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+nova_state.json
+nova_state.tmp
+work/
+assets/
+__pycache__/
+*.py[cod]

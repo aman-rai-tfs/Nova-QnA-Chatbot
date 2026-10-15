@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.env.*
+nova_state.json
+*.docx
+assets/
+work/
+__pycache__/
+*.py[cod]
