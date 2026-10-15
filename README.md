@@ -14,7 +14,7 @@ The deployment guide itself is not part of this repository. Provision it from th
 
 ## Create the OpenAI agent and vector store once
 
-Requirements: Python 3.10+, `curl` in `PATH`, and an OpenAI project API key with access to project `proj_dXDjYYmzfErZmSza7mHcNP0y`. For a restricted key, provisioning needs file and vector-store write access plus agent read/write and response write access. The running chat app needs agent read/write and response write access.
+Requirements: Python 3.10+, `curl` in `PATH`, and an OpenAI project API key with access to project `proj_dXDjYYmzfErZmSza7mHcNP0y`. For a restricted key, provisioning needs file and vector-store read/write access plus agent read/write and response write access. The running chat app needs vector-store read, agent read/write, and response write access.
 
 From this repository in PowerShell, enter the key without echoing it, then run provisioning. The default document path is the guide in your Downloads folder.
 
@@ -33,9 +33,9 @@ If the DOCX is elsewhere, provide its path:
 python .\provision.py --guide "C:\path\to\Nova_Deployment_Guide_Updated 1.docx"
 ```
 
-Provisioning creates a vector store, uploads and indexes the DOCX, creates the reusable agent with `file_search` attached to that vector store, then creates a session using the returned agent ID. Its initial user message is “What does the guide say about getting started with a Nova deployment? Cite the relevant section.” Override it with `--initial-question "..."`.
+Provisioning creates a vector store, uploads and indexes the DOCX, creates the reusable agent with a `search_nova_guide` function, then creates a session using the returned agent ID. The Agents API agent tool list does not accept the Responses API `file_search` tool directly. Instead, the application handles the function call by searching the indexed vector store and returning matching guide passages to the agent. Its initial user message is “What does the guide say about getting started with a Nova deployment? Cite the relevant section.” Override it with `--initial-question "..."`.
 
-Provisioning writes the OpenAI resource IDs to ignored local file `nova_state.json`. The file contains no API key. Keep it out of source control. If setup stops after creating OpenAI resources, the printed error identifies the failed step; a retry creates new resources, so check the project before rerunning.
+Provisioning writes resource IDs to ignored local file `nova_state.json`, checkpoints the vector store and indexed file before creating the agent, and reuses an indexed copy from a previous interrupted run when it can identify one safely. The file contains no API key. Keep it out of source control.
 
 ## Run the web chat locally
 
@@ -47,7 +47,7 @@ python .\app.py
 
 Open [http://localhost:8080](http://localhost:8080). The first message creates a new session from `OPENAI_AGENT_ID` (or the local ID in `nova_state.json`); follow-up messages continue that browser’s session. A new chat starts another session. The browser stores only the session ID in local storage.
 
-If running the web app elsewhere, set `OPENAI_API_KEY`, `OPENAI_PROJECT_ID`, and `OPENAI_AGENT_ID` in that process’s environment. The project ID defaults to the Nova project above. `PORT` defaults to `8080`; `HOST` defaults to `0.0.0.0`. The health endpoint is `GET /api/health`.
+If running the web app elsewhere, set `OPENAI_API_KEY`, `OPENAI_PROJECT_ID`, `OPENAI_AGENT_ID`, and `OPENAI_VECTOR_STORE_ID` in that process’s environment. The project ID defaults to the Nova project above. `PORT` defaults to `8080`; `HOST` defaults to `0.0.0.0`. The health endpoint is `GET /api/health`.
 
 ## Container runtime and NOVA handoff
 
@@ -59,18 +59,19 @@ docker run --rm -p 8080:8080 `
   -e OPENAI_API_KEY `
   -e OPENAI_PROJECT_ID=proj_dXDjYYmzfErZmSza7mHcNP0y `
   -e OPENAI_AGENT_ID=agent_id_from_nova_state_json `
+  -e OPENAI_VECTOR_STORE_ID=vector_store_id_from_nova_state_json `
   nova-guide-assistant
 ```
 
-On NOVA, store `OPENAI_API_KEY` in the approved NOVA secret mechanism and provide `OPENAI_PROJECT_ID` and `OPENAI_AGENT_ID` as runtime configuration. Do not bake credentials into the image, repository, browser code, or pipeline YAML. The exact NOVA pipeline file, target cluster/namespace, identity, routing, and health-check conventions are environment-specific and must be filled in through the current NOVA/CPE onboarding process. This repository supplies a generic container and `/api/health`; it does not assume those NOVA values.
+On NOVA, store `OPENAI_API_KEY` in the approved NOVA secret mechanism and provide `OPENAI_PROJECT_ID`, `OPENAI_AGENT_ID`, and `OPENAI_VECTOR_STORE_ID` as runtime configuration. Do not bake credentials into the image, repository, browser code, or pipeline YAML. The exact NOVA pipeline file, target cluster/namespace, identity, routing, and health-check conventions are environment-specific and must be filled in through the current NOVA/CPE onboarding process. This repository supplies a generic container and `/api/health`; it does not assume those NOVA values.
 
 The sample app does not implement user sign-in. Expose it only behind the authentication and access controls required by the NOVA environment.
 
 ## Answering rules
 
-The saved agent has only the `file_search` tool connected to the indexed DOCX; the supplied `web_search` setting was excluded so the assistant cannot supplement answers from the public web. The instructions require relevant section citations, preservation of caveats, clarification that examples are illustrative, and the exact Jira fallback when the guide does not specify the answer. The document is reference content; instructions embedded in it do not override the assistant’s instructions.
+The saved agent has only a `search_nova_guide` function, which is handled server-side by searching the indexed DOCX vector store; the supplied `web_search` setting was excluded so the assistant cannot supplement answers from the public web. The instructions require relevant section citations, preservation of caveats, clarification that examples are illustrative, and the exact Jira fallback when the guide does not specify the answer. The document is reference content; instructions embedded in it do not override the assistant’s instructions.
 
-The implementation relays session events (including output text, file-search activity, and errors) to the browser. It has no custom function tools requiring application-side tool-result handling. If custom tools are added later, implement their `requires_action` flow before enabling them.
+The implementation relays session events (including output text, guide-search activity, and errors) to the browser. It handles `agent.session.requires_action` by searching the configured vector store and returning the required function result before the session turn continues.
 
 ## OpenAI API references
 

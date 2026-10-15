@@ -9,8 +9,6 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
-
 from openai_http import DEFAULT_PROJECT_ID, OpenAIRequestError, session_id_from_event, stream_followup_session, stream_initial_session
 
 ROOT = Path(__file__).resolve().parent
@@ -28,6 +26,19 @@ def agent_id() -> str:
     if STATE_PATH.is_file():
         try:
             value = json.loads(STATE_PATH.read_text(encoding="utf-8")).get("agent_id", "")
+            return value.strip() if isinstance(value, str) else ""
+        except (OSError, json.JSONDecodeError):
+            return ""
+    return ""
+
+
+def guide_vector_store_id() -> str:
+    configured = os.environ.get("OPENAI_VECTOR_STORE_ID", "").strip()
+    if configured:
+        return configured
+    if STATE_PATH.is_file():
+        try:
+            value = json.loads(STATE_PATH.read_text(encoding="utf-8")).get("vector_store_id", "")
             return value.strip() if isinstance(value, str) else ""
         except (OSError, json.JSONDecodeError):
             return ""
@@ -52,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(200, {
                 "ok": True,
                 "agent_configured": bool(agent_id()),
+                "guide_search_configured": bool(guide_vector_store_id()),
                 "project_id": os.environ.get("OPENAI_PROJECT_ID", DEFAULT_PROJECT_ID),
             })
             return
@@ -101,6 +113,10 @@ class Handler(BaseHTTPRequestHandler):
         if not current_agent:
             self._json_response(503, {"error": "No saved agent is configured. Run provision.py first or set OPENAI_AGENT_ID."})
             return
+        current_vector_store = guide_vector_store_id()
+        if not current_vector_store:
+            self._json_response(503, {"error": "No guide vector store is configured. Run provision.py first or set OPENAI_VECTOR_STORE_ID."})
+            return
         if not os.environ.get("OPENAI_API_KEY", "").strip():
             self._json_response(503, {"error": "OPENAI_API_KEY is not configured in the application runtime."})
             return
@@ -133,11 +149,11 @@ class Handler(BaseHTTPRequestHandler):
                     relay("error", {"type": "error", "error": {"message": "A response is already in progress for this session."}})
                     return
                 try:
-                    stream_followup_session(session_id, message.strip(), relay)
+                    stream_followup_session(session_id, message.strip(), relay, current_vector_store)
                 finally:
                     lock.release()
             else:
-                new_session = stream_initial_session(current_agent, message.strip(), relay)
+                new_session = stream_initial_session(current_agent, message.strip(), relay, current_vector_store)
                 # Emit an explicit session association in case the upstream lifecycle event omitted it.
                 relay("app.session", {"type": "app.session", "session_id": new_session})
             self.wfile.write(b"event: done\ndata: {}\n\n")

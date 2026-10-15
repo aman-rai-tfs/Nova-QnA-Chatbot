@@ -20,6 +20,7 @@ INSTRUCTIONS = """You are the Nova Deployment Guide Q&A assistant.
 Answer user questions strictly by referencing the indexed Nova Deployment Guide only. Do not use outside knowledge or assumptions.
 
 - Always search the Nova Deployment Guide before answering factual questions. Cite relevant sections or subsections explicitly.
+- Before any factual answer, call the `search_nova_guide` function and base factual claims only on the passages it returns.
 - Give clear, actionable answers based only on guide content.
 - Preserve caveats such as “in progress” or “still being validated.”
 - Treat examples in the guide as illustrative only, not approved procedures.
@@ -36,6 +37,38 @@ def save_state(state: dict) -> None:
     temporary.replace(STATE_PATH)
 
 
+def load_state() -> dict:
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def find_existing_guide(guide: Path) -> tuple[str, str] | None:
+    """Recover the indexed store/file from a previous run that failed before checkpointing."""
+    stores = request_json("GET", "/vector_stores?limit=100").get("data", [])
+    candidates: list[tuple[str, str]] = []
+    for store in stores:
+        if store.get("name") != "Nova Deployment Guide knowledge base":
+            continue
+        store_id = store.get("id")
+        if not isinstance(store_id, str):
+            continue
+        listing = request_json("GET", f"/vector_stores/{quote(store_id, safe='')}/files?limit=100")
+        for attached in listing.get("data", []):
+            file_id = attached.get("id")
+            if not isinstance(file_id, str) or attached.get("status") not in {"completed", "in_progress"}:
+                continue
+            file_info = request_json("GET", f"/files/{quote(file_id, safe='')}")
+            if file_info.get("filename") == guide.name and file_info.get("bytes") == guide.stat().st_size:
+                candidates.append((store_id, file_id))
+    if len(candidates) > 1:
+        ids = ", ".join(store_id for store_id, _ in candidates)
+        raise RuntimeError(f"Found multiple existing indexed copies of {guide.name} in stores {ids}. Review the OpenAI project before retrying.")
+    return candidates[0] if candidates else None
+
+
 def print_event(event_type: str, payload: dict) -> None:
     print(f"[event: {event_type}] {json.dumps(payload, ensure_ascii=False)}", flush=True)
     if event_type.endswith(("turn.failed", "turn.cancelled", "session.failed", "environment.failed")) or event_type == "error":
@@ -50,18 +83,30 @@ def provision(guide: Path, initial_question: str, project_id: str) -> None:
         raise RuntimeError("The source guide must be a .docx file.")
     os.environ["OPENAI_PROJECT_ID"] = project_id
 
-    print(f"Creating vector store in OpenAI project {project_id}…")
-    store = request_json("POST", "/vector_stores", {"name": "Nova Deployment Guide knowledge base"})
-    vector_store_id = store["id"]
+    state = load_state()
+    if state.get("project_id") != project_id or state.get("guide_file_name") != guide.name:
+        state = {}
+    vector_store_id = state.get("vector_store_id")
+    file_id = state.get("file_id")
 
-    print(f"Uploading guide from {guide}…")
-    file_response = upload_file(guide)
-    file_id = file_response["id"]
-    request_json(
-        "POST",
-        f"/vector_stores/{quote(vector_store_id, safe='')}/files",
-        {"file_id": file_id},
-    )
+    if not vector_store_id or not file_id:
+        recovered = find_existing_guide(guide)
+        if recovered:
+            vector_store_id, file_id = recovered
+            print(f"Reusing the already indexed guide in vector store {vector_store_id}.")
+        else:
+            print(f"Creating vector store in OpenAI project {project_id}…")
+            store = request_json("POST", "/vector_stores", {"name": "Nova Deployment Guide knowledge base"})
+            vector_store_id = store["id"]
+
+            print(f"Uploading guide from {guide}…")
+            file_response = upload_file(guide)
+            file_id = file_response["id"]
+            request_json(
+                "POST",
+                f"/vector_stores/{quote(vector_store_id, safe='')}/files",
+                {"file_id": file_id},
+            )
 
     print("Waiting for document indexing…")
     for _ in range(150):
@@ -78,29 +123,43 @@ def provision(guide: Path, initial_question: str, project_id: str) -> None:
     else:
         raise RuntimeError("Timed out after five minutes while waiting for vector-store indexing.")
 
-    print("Creating reusable guide-only agent…")
-    agent = request_json("POST", "/agents", {
-        "name": AGENT_NAME,
-        "model": MODEL,
-        "instructions": INSTRUCTIONS,
-        "tools": [{"type": "file_search", "vector_store_ids": [vector_store_id]}],
-        "multi_agent": {"enabled": False},
-        "reasoning": {"effort": "medium", "summary": "auto"},
-        "text": {"format": {"type": "text"}, "verbosity": "medium"},
-    })
-    state = {
+    state.update({
         "project_id": project_id,
-        "agent_id": agent["id"],
         "vector_store_id": vector_store_id,
         "file_id": file_id,
         "guide_file_name": guide.name,
-    }
+    })
     save_state(state)
-    print(f"Reusable agent created: {state['agent_id']}")
+    created_agent = not state.get("agent_id")
+    if created_agent:
+        print("Creating reusable guide-only agent…")
+        agent = request_json("POST", "/agents", {
+            "name": AGENT_NAME,
+            "model": MODEL,
+            "instructions": INSTRUCTIONS,
+            "tools": [{
+                "type": "function",
+                "name": "search_nova_guide",
+                "description": "Search the indexed Nova Deployment Guide. Call this before answering factual questions. Use focused queries containing the user's topic and relevant terms. Return only matching guide passages; do not add outside information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "A focused search query for the Nova Deployment Guide."}},
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            }],
+            "multi_agent": {"enabled": False},
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "text": {"format": {"type": "text"}, "verbosity": "medium"},
+        })
+        state["agent_id"] = agent["id"]
+        save_state(state)
+    label = "created" if created_agent else "reusing"
+    print(f"Reusable agent {label}: {state['agent_id']}")
     print(f"Vector store created: {vector_store_id}")
     print("Starting an initial session with this agent and streaming its events…")
     try:
-        session_id = stream_initial_session(state["agent_id"], initial_question, print_event)
+        session_id = stream_initial_session(state["agent_id"], initial_question, print_event, vector_store_id)
     except OpenAIRequestError:
         # Preserve the successfully created agent and vector store so setup is recoverable.
         raise

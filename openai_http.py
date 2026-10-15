@@ -142,6 +142,74 @@ def session_id_from_event(payload: object) -> str | None:
     return None
 
 
+def search_nova_guide(vector_store_id: str, query: str) -> dict:
+    """Search the guide vector store for text to return through the Agents function tool."""
+    result = request_json(
+        "POST",
+        f"/vector_stores/{quote(vector_store_id, safe='')}/search",
+        {"query": query, "max_num_results": 8},
+    )
+    matches = []
+    for item in result.get("data", []):
+        passages = []
+        for block in item.get("content", []):
+            if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"].strip():
+                passages.append(block["text"].strip())
+        text = "\n".join(passages)
+        if text:
+            matches.append({
+                "file_id": item.get("file_id"),
+                "score": item.get("score"),
+                "text": text[:12000],
+            })
+    return {"query": query, "matches": matches}
+
+
+def handle_required_actions(payload: dict, vector_store_id: str) -> None:
+    """Run pending guide-search function calls and submit their results to the session."""
+    session_id = session_id_from_event(payload)
+    session = payload.get("session")
+    actions = session.get("required_actions", []) if isinstance(session, dict) else payload.get("required_actions", [])
+    if not session_id or not isinstance(actions, list):
+        raise OpenAIRequestError("The session requested tool work without a usable session ID or action list.")
+
+    for action in actions:
+        if not isinstance(action, dict) or action.get("type") != "function_call":
+            raise OpenAIRequestError("The session requested an unsupported action.")
+        turn_id, call_id = action.get("turn_id"), action.get("call_id")
+        if not isinstance(turn_id, str) or not isinstance(call_id, str):
+            raise OpenAIRequestError("The session returned a function call without its turn or call ID.")
+        outcome: dict
+        if action.get("name") != "search_nova_guide":
+            outcome = {"success": False, "error": f"Unsupported function: {action.get('name', '')}"}
+        else:
+            arguments = action.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            query = arguments.get("query") if isinstance(arguments, dict) else None
+            if not isinstance(query, str) or not query.strip():
+                outcome = {"success": False, "error": "The guide search query was missing or invalid."}
+            else:
+                try:
+                    outcome = {"success": True, "output": json.dumps(search_nova_guide(vector_store_id, query.strip()), ensure_ascii=False)}
+                except OpenAIRequestError as exc:
+                    outcome = {"success": False, "error": str(exc)}
+        request_json(
+            "POST",
+            f"/agents/sessions/{quote(session_id, safe='')}/events",
+            {"events": [{
+                "type": "agent.session.input.tool_result",
+                "turn_id": turn_id,
+                "call_id": call_id,
+                **outcome,
+            }]},
+            extra_headers=["Idempotency-Key: " + uuid4().hex],
+        )
+
+
 def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
     event_name = "message"
     data: list[str] = []
@@ -183,7 +251,12 @@ def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
                 on_event(event_name, payload)
 
 
-def stream_initial_session(agent_id: str, message: str, on_event: Callable[[str, dict], None]) -> str:
+def stream_initial_session(
+    agent_id: str,
+    message: str,
+    on_event: Callable[[str, dict], None],
+    vector_store_id: str,
+) -> str:
     config = _config_stdin()
     body = {
         "agent_id": agent_id,
@@ -213,6 +286,8 @@ def stream_initial_session(agent_id: str, message: str, on_event: Callable[[str,
             if actual_type in {"agent.session.turn.failed", "agent.session.turn.cancelled", "agent.session.failed", "agent.session.environment.failed", "error"}:
                 detail = payload.get("error", {}).get("message", "") if isinstance(payload.get("error"), dict) else ""
                 raise OpenAIRequestError(f"Agent session failed ({actual_type}): {detail}".rstrip())
+            if actual_type == "agent.session.requires_action":
+                handle_required_actions(payload, vector_store_id)
             if actual_type == "agent.session.turn.completed":
                 completed = True
                 raise _TurnCompleted()
@@ -241,7 +316,12 @@ def stream_initial_session(agent_id: str, message: str, on_event: Callable[[str,
         Path(body_path).unlink(missing_ok=True)
 
 
-def stream_followup_session(session_id: str, message: str, on_event: Callable[[str, dict], None]) -> None:
+def stream_followup_session(
+    session_id: str,
+    message: str,
+    on_event: Callable[[str, dict], None],
+    vector_store_id: str,
+) -> None:
     config = _config_stdin()
     encoded_session_id = quote(session_id, safe="")
     endpoint = f"/agents/sessions/{encoded_session_id}/events?stream=true"
@@ -291,6 +371,8 @@ def stream_followup_session(session_id: str, message: str, on_event: Callable[[s
             if actual_type in {"agent.session.turn.failed", "agent.session.turn.cancelled", "agent.session.failed", "agent.session.environment.failed", "error"}:
                 detail = payload.get("error", {}).get("message", "") if isinstance(payload.get("error"), dict) else ""
                 raise OpenAIRequestError(f"Agent session failed ({actual_type}): {detail}".rstrip())
+            if actual_type == "agent.session.requires_action":
+                handle_required_actions(payload, vector_store_id)
             if actual_type == "agent.session.turn.completed":
                 completed = True
                 raise _TurnCompleted()
