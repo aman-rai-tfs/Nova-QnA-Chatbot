@@ -64,6 +64,7 @@ def request_json(
     payload: dict | None = None,
     *,
     extra_headers: list[str] | None = None,
+    allow_empty_response: bool = False,
 ) -> dict:
     config = _config_stdin()
     args = _request_args(method, BASE_URL + endpoint)
@@ -84,6 +85,10 @@ def request_json(
             Path(temp_name).unlink(missing_ok=True)
     if result.returncode:
         raise OpenAIRequestError(_error_text(result.stdout, result.stderr, result.returncode))
+    if allow_empty_response and not result.stdout.strip():
+        # The Agents session events endpoint acknowledges accepted events with HTTP 202,
+        # which may have no response body. curl's exit status already verifies success.
+        return {}
     try:
         parsed = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -207,6 +212,7 @@ def handle_required_actions(payload: dict, vector_store_id: str) -> None:
                 **outcome,
             }]},
             extra_headers=["Idempotency-Key: " + uuid4().hex],
+            allow_empty_response=True,
         )
 
 
