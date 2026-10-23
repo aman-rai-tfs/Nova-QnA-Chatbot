@@ -58,7 +58,7 @@ def fingerprint(value) -> str:
 def http_tool() -> dict:
     return {"type": "mcp", "server_label": setup.SERVER_LABEL,
             "transport": {"type": "http", "server_url": "http://127.0.0.1:8765/mcp"},
-            "connection_origin": "environment", "request_metadata": {},
+            "connection_origin": "environment",
             "allowed_tools": ["search_nova_guide"], "required": True}
 
 
@@ -87,6 +87,14 @@ def agent_fields(value: dict) -> dict:
             if (transport.get("authorization") or transport.get("headers")
                     or transport.get("env") or tool.get("authorization")):
                 raise ValueError("Remove inline credentials/headers/env from the draft; use Vault credential IDs.")
+            # GET responses and the Platform editor may supply an empty map.
+            # It is accepted on writes only for service-origin HTTP MCPs.
+            if transport.get("type") != "http" or tool.get("connection_origin") == "environment":
+                if tool.get("request_metadata"):
+                    raise ValueError("Nonempty MCP request_metadata requires service-origin HTTP; review the draft.")
+                tool.pop("request_metadata", None)
+            if transport.get("type") == "stdio":
+                tool.pop("connection_origin", None)
     return result
 
 
@@ -198,6 +206,7 @@ def verify(candidate: dict, agent_id: str, template_id: str, vault_ids: list[str
         "For a Jira-sites question call getAccessibleAtlassianResources and report its result. "
         "Do not create or change anything. Report tool failures honestly; never substitute a claimed result."
     )
+    print("Creating a read-only verification session with the HTTP guide configuration...", flush=True)
     session = api.request_json("POST", "/agents/sessions", {
         "agent_id": agent_id, "agent": overrides, "vault_ids": vault_ids,
         "environment": {"type": "openai_hosted", "environment_template_id": template_id},
@@ -280,8 +289,26 @@ def main(argv: list[str] | None = None) -> int:
     if migration and not args.resume:
         raise ValueError("An HTTP migration is checkpointed. Retry with --resume to reuse it.")
     configuration = fingerprint({"template": body, "candidate": candidate, "vault_ids": vault_ids})
-    if migration and (migration.get("agent_id") != agent_id or migration.get("configuration_sha256") != configuration):
-        raise ValueError("The migration draft or code changed. Review the existing guide_http_migration checkpoint before replacing it.")
+    if migration:
+        # Repair exactly the failed v1 request shape. The template's files,
+        # Vaults, model, instructions, Jira credential and permissions must match.
+        # Reuse its template rather than creating duplicate resources.
+        legacy_candidate = copy.deepcopy(candidate)
+        for tool in legacy_candidate["tools"]:
+            if tool.get("server_label") == setup.SERVER_LABEL:
+                tool["request_metadata"] = {}
+        legacy_configuration = fingerprint({"template": body, "candidate": legacy_candidate, "vault_ids": vault_ids})
+        if (migration.get("agent_id") == agent_id
+                and migration.get("configuration_sha256") == legacy_configuration
+                and agent_fields(migration.get("candidate_agent")) == candidate
+                and not migration.get("applied") and not migration.get("verification_session_id")):
+            migration["previous_configuration_sha256"] = migration["configuration_sha256"]
+            migration["configuration_sha256"] = configuration
+            migration["candidate_agent"] = copy.deepcopy(candidate)
+            setup.write_state(state)
+            print("Repaired the rejected metadata field in the checkpoint; reusing the existing HTTP template.", flush=True)
+        if migration.get("agent_id") != agent_id or migration.get("configuration_sha256") != configuration:
+            raise ValueError("The migration draft or code changed. Review the existing guide_http_migration checkpoint before replacing it.")
     if not migration:
         migration = {"agent_id": agent_id, "project_id": project_id, "configuration_sha256": configuration,
                      "previous_agent": saved, "candidate_agent": candidate,
@@ -295,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
         template_id = setup.validate_id(template.get("id"), "envtmpl_")
         migration["environment_template_id"] = template_id
         setup.write_state(state)
+    else:
+        print("Reusing HTTP environment template: " + template_id, flush=True)
     # Every apply/resume performs fresh checks. A previous PASS is not reused.
     verify(candidate, agent_id, template_id, vault_ids, state, migration)
     latest = agent_fields(api.request_json("GET", endpoint))
@@ -302,7 +331,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("The saved agent changed during verification. No update applied; review concurrent edits before resuming.")
     print("Read checks passed. Saving HTTP guide MCP and the reviewed Jira draft...", flush=True)
     api.request_json("POST", endpoint, candidate, extra_headers=["Idempotency-Key: " + uuid4().hex])
-    # Exercise a read/save round trip, including empty HTTP request_metadata.
+    # Normalize response defaults before saving: environment-origin MCP cannot
+    # include request_metadata, even when a GET response contains an empty map.
     readback = agent_fields(api.request_json("GET", endpoint))
     readback_guide = next((t for t in readback["tools"] if t.get("server_label") == setup.SERVER_LABEL), {})
     if (readback_guide.get("transport", {}).get("type") != "http"
@@ -319,7 +349,8 @@ def main(argv: list[str] | None = None) -> int:
     print("Environment template: " + TEMPLATE_NAME + " (" + template_id + ")")
     print("Guide API secret: " + guide_credential + " in " + guide_vault)
     print("Refresh the old Platform draft only now. Start a NEW hosted session with this template and the guide API secret.")
-    print("Platform UI Save still needs a browser check. Jira creation permission has not been tested; no ticket was created.")
+    print("Platform UI Save may still add unsupported metadata; it is not verified by this API check.")
+    print("Jira creation permission has not been tested; no ticket was created.")
     if args.run_app:
         os.environ.update(OPENAI_AGENT_ID=agent_id, OPENAI_VECTOR_STORE_ID=store_id,
                           OPENAI_ENVIRONMENT_TEMPLATE_ID=template_id, OPENAI_VAULT_IDS=json.dumps(vault_ids))

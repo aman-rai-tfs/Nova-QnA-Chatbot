@@ -4,8 +4,12 @@
 
 The Platform editor can add `request_metadata: {}` when saving a stdio MCP.
 The API rejects that combination with `mcp request_metadata requires an HTTP
-server`. Removing that field once does not prevent the editor from adding it
-again. The migration below changes guide MCP to HTTP inside each sandbox.
+server`. Its fuller validation error also requires **service-origin** HTTP:
+environment-origin HTTP rejects this field even when it is an empty map.
+The migration below changes guide MCP to HTTP inside each sandbox and omits
+unsupported metadata from session requests, agent updates, and read/save
+round trips. This does not establish that the Platform editor's Save button
+will preserve the corrected shape: it may reinsert the unsupported field.
 It needs a one-time local setup command; subsequent guide and Jira requests
 still run through the bot or Platform session.
 
@@ -59,7 +63,8 @@ flag does not grant Atlassian permissions or prove that the token has write
 scope. Actual Jira creation is not executed by the migration.
 
 After read checks pass, the helper saves the agent and checks an API
-retrieve/save round trip with HTTP metadata. It records the old agent definition
+retrieve/save round trip, stripping unsupported empty metadata from response
+defaults. It records the old agent definition
 and template ID in ignored `nova_state.json` for recovery. Existing sessions
 keep their original configuration. The original stdio helper refuses to
 overwrite an applied HTTP setup.
@@ -68,11 +73,19 @@ If interrupted after a resource was checkpointed, retry the same apply command
 with `--resume`. The existing HTTP template is reused; a new read-only
 verification session is run. Keep the draft and script version unchanged.
 
+For the first migration version's `request_metadata requires a service-origin
+HTTP server` error, the corrected helper recognizes that exact checkpoint
+configuration and removes only the rejected metadata field. Use `--resume`;
+do not delete `nova_state.json`, the saved draft, or the created template.
+
 Only after PASS:
 
 1. Refresh the old agent draft page to load the preserved, migrated definition.
-2. Click **Save agent definition** once. This is the browser verification;
-   an API round trip alone does not establish that the UI preserved every field.
+2. Check **Save agent definition** once. This is browser verification, not a
+   guaranteed result. If the same metadata error returns, preserve the draft
+   and use the corrected API helper for saves. A public, authenticated
+   service-origin HTTP deployment would require separate hosting; changing the
+   loopback connection's origin to `service` will not work.
 3. Start a **new OpenAI-hosted** session with **Nova guide MCP HTTP**, matching
    the template ID printed by migration. Attach **Nova guide search API access**
    in API secrets and retain the saved Atlassian connection.
