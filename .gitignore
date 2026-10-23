@@ -3,6 +3,7 @@
 !.env.example
 nova_state.json
 nova_state.tmp
+nova_state.json.tmp
 work/
 assets/
 __pycache__/

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
 import subprocess
-import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 from urllib.parse import quote
@@ -15,6 +16,8 @@ from uuid import uuid4
 BASE_URL = "https://api.openai.com/v1"
 DEFAULT_PROJECT_ID = "proj_dXDjYYmzfErZmSza7mHcNP0y"
 AGENTS_BETA_HEADER = "OpenAI-Beta: agents=v1"
+ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v2/mcp"
+_extra_runtime_secrets: list[str] = []
 
 
 class OpenAIRequestError(RuntimeError):
@@ -23,6 +26,47 @@ class OpenAIRequestError(RuntimeError):
 
 class _TurnCompleted(Exception):
     """Stop a live event stream immediately after the root turn completes."""
+
+
+def atlassian_basic_authorization() -> str | None:
+    """Personal Atlassian tokens use Basic auth; never save this in an agent."""
+    email = os.environ.get("ATLASSIAN_EMAIL", "").strip()
+    token = os.environ.get("ATLASSIAN_API_TOKEN", "").strip()
+    if not email and not token:
+        return None
+    if not email or not token:
+        raise OpenAIRequestError("Configure both ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN, or run app.py --atlassian-mcp.")
+    if ":" in email or any(char in email + token for char in ("\r", "\n", "\0")):
+        raise OpenAIRequestError("The Atlassian email or token contains an invalid character.")
+    return "Basic " + base64.b64encode((email + ":" + token).encode("utf-8")).decode("ascii")
+
+
+def _redact_runtime_secrets(value: str) -> str:
+    secrets = [os.environ.get("OPENAI_API_KEY", "").strip(), os.environ.get("ATLASSIAN_API_TOKEN", "").strip(), *_extra_runtime_secrets]
+    try:
+        authorization = atlassian_basic_authorization()
+    except OpenAIRequestError:
+        authorization = None
+    if authorization:
+        secrets.extend([authorization, authorization.removeprefix("Basic ")])
+    for secret in sorted((secret for secret in secrets if secret), key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
+    return value
+
+
+def register_runtime_secrets(*values: str) -> None:
+    """Redact short-lived OAuth secrets from diagnostics without writing them."""
+    _extra_runtime_secrets.extend(value for value in values if isinstance(value, str) and value)
+
+
+def _safe_event(value):
+    if isinstance(value, str):
+        return _redact_runtime_secrets(value)
+    if isinstance(value, dict):
+        return {key: _safe_event(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_event(item) for item in value]
+    return value
 
 
 def _curl() -> str:
@@ -51,9 +95,9 @@ def _config_stdin() -> str:
 
 
 def _request_args(method: str, url: str, *, stream: bool = False) -> list[str]:
-    args = [_curl(), "--config", "-", "--silent", "--show-error", "--fail-with-body"]
+    args = [_curl(), "--disable", "--config", "-", "--silent", "--show-error", "--fail-with-body", "--proto", "=https"]
     if stream:
-        args.extend(["--no-buffer", "-N", "-H", "Accept: text/event-stream"])
+        args.extend(["--no-buffer", "-N", "--suppress-connect-headers", "-H", "Accept: text/event-stream"])
     args.extend(["-X", method, url])
     return args
 
@@ -71,18 +115,10 @@ def request_json(
     if extra_headers:
         for header in extra_headers:
             args.extend(["-H", header])
-    temp_name: str | None = None
     if payload is not None:
         args.extend(["-H", "Content-Type: application/json"])
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as body:
-            json.dump(payload, body, ensure_ascii=False)
-            temp_name = body.name
-        args.extend(["--data-binary", f"@{temp_name}"])
-    try:
-        result = subprocess.run(args, input=config, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    finally:
-        if temp_name:
-            Path(temp_name).unlink(missing_ok=True)
+        config += 'data-binary = "' + _config_value(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) + '"\n'
+    result = subprocess.run(args, input=config, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode:
         raise OpenAIRequestError(_error_text(result.stdout, result.stderr, result.returncode))
     if allow_empty_response and not result.stdout.strip():
@@ -92,7 +128,7 @@ def request_json(
     try:
         parsed = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise OpenAIRequestError(f"OpenAI returned a non-JSON response: {result.stdout[:800]}") from exc
+        raise OpenAIRequestError("OpenAI returned a non-JSON response: " + _redact_runtime_secrets(result.stdout[:800])) from exc
     if not isinstance(parsed, dict):
         raise OpenAIRequestError("OpenAI returned an unexpected response shape.")
     return parsed
@@ -119,6 +155,8 @@ def upload_file(path: Path) -> dict:
 
 
 def _error_text(stdout: str, stderr: str, code: int) -> str:
+    stdout = _redact_runtime_secrets(stdout)
+    stderr = _redact_runtime_secrets(stderr)
     body = stdout.strip()
     if body:
         try:
@@ -126,7 +164,9 @@ def _error_text(stdout: str, stderr: str, code: int) -> str:
             error = parsed.get("error", parsed)
             if isinstance(error, dict):
                 message = error.get("message") or error.get("code") or json.dumps(error, ensure_ascii=False)
-                return f"OpenAI request failed: {message}"
+                details = [f"{name}={error[name]}" for name in ("code", "param") if error.get(name)]
+                suffix = f" ({', '.join(details)})" if details else ""
+                return f"OpenAI request failed: {message}{suffix}"
         except json.JSONDecodeError:
             return f"OpenAI request failed: {body[:1000]}"
     return f"curl exited with status {code}: {stderr.strip()[:1000]}"
@@ -219,6 +259,7 @@ def handle_required_actions(payload: dict, vector_store_id: str) -> None:
 def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
     event_name = "message"
     data: list[str] = []
+    error_body: list[str] = []
     for raw_line in stdout:
         line = raw_line.rstrip("\r\n")
         if line.startswith(":"):
@@ -227,14 +268,8 @@ def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
             event_name = line[6:].strip() or "message"
         elif line.startswith("data:"):
             data.append(line[5:].lstrip())
-        elif not data and line.startswith("{"):
-            # With --fail-with-body, curl can return a JSON API error instead of SSE.
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                on_event("error", payload)
+        elif line.startswith(("id:", "retry:")):
+            continue
         elif line == "" and data:
             raw = "\n".join(data)
             if raw != "[DONE]":
@@ -243,9 +278,15 @@ def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
                 except json.JSONDecodeError:
                     payload = {"type": "error", "error": {"message": raw}}
                 if isinstance(payload, dict):
-                    on_event(event_name, payload)
+                    on_event(event_name, _safe_event(payload))
             event_name = "message"
             data.clear()
+        elif line.strip() and not data:
+            # HTTP failures can contain a pretty-printed JSON body, not SSE.
+            # Preserve the complete body so the actual API error reaches the UI.
+            error_body.append(raw_line)
+    if error_body:
+        raise OpenAIRequestError(_error_text("".join(error_body), "", 22))
     if data:
         raw = "\n".join(data)
         if raw != "[DONE]":
@@ -254,7 +295,35 @@ def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
             except json.JSONDecodeError:
                 payload = {"type": "error", "error": {"message": raw}}
             if isinstance(payload, dict):
-                on_event(event_name, payload)
+                on_event(event_name, _safe_event(payload))
+
+
+def _wait_for_hosted_environment(session: dict, on_event: Callable[[str, dict], None], *, timeout: float = 300) -> None:
+    """Wait for provisioning before submitting the first model turn."""
+    session_id = session["id"]
+    deadline = time.monotonic() + timeout
+    last_status = None
+    while True:
+        if session.get("status") == "failed":
+            raise OpenAIRequestError("The hosted session failed before input: " + _redact_runtime_secrets(str(session.get("error") or "no detail")))
+        environment = session.get("environment") or {}
+        environment_id = environment.get("id") if isinstance(environment, dict) else None
+        if environment_id:
+            info = request_json("GET", "/agents/environments/" + quote(environment_id, safe=""))
+            status = info.get("status", "pending")
+        else:
+            status = "pending"
+        if status != last_status:
+            on_event("app.environment", {"type": "app.environment", "session_id": session_id, "status": status})
+            last_status = status
+        if status == "connected":
+            return
+        if status in ("failed", "expired"):
+            raise OpenAIRequestError("The hosted environment could not start (" + status + "). Session: " + session_id)
+        if time.monotonic() >= deadline:
+            raise OpenAIRequestError("Timed out waiting for the hosted environment. No user input was submitted. Session: " + session_id)
+        time.sleep(2)
+        session = request_json("GET", "/agents/sessions/" + quote(session_id, safe=""))
 
 
 def stream_initial_session(
@@ -262,19 +331,37 @@ def stream_initial_session(
     message: str,
     on_event: Callable[[str, dict], None],
     vector_store_id: str,
+    *,
+    vault_ids: list[str] | None = None,
+    environment: dict | None = None,
 ) -> str:
+    if environment and environment.get("type") == "openai_hosted":
+        # Match the Platform UI: create an idle session, wait for provisioning,
+        # subscribe to events, then submit the initial user message separately.
+        body = {"agent_id": agent_id, "environment": environment}
+        if vault_ids:
+            body["vault_ids"] = vault_ids
+        session = request_json("POST", "/agents/sessions", body, extra_headers=["Idempotency-Key: " + uuid4().hex])
+        session_id = session.get("id")
+        if not isinstance(session_id, str) or not session_id.startswith("sess_"):
+            raise OpenAIRequestError("OpenAI did not return a hosted session ID.")
+        on_event("app.session", {"type": "app.session", "session_id": session_id})
+        _wait_for_hosted_environment(session, on_event)
+        stream_followup_session(session_id, message, on_event, vector_store_id)
+        return session_id
     config = _config_stdin()
     body = {
         "agent_id": agent_id,
-        "environment": {"type": "none"},
+        "environment": environment if environment is not None else {"type": "none"},
         "input": message,
         "stream": True,
     }
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as body_file:
-        json.dump(body, body_file, ensure_ascii=False)
-        body_path = body_file.name
+    if vault_ids:
+        body["vault_ids"] = vault_ids
+    # MCP credentials are supplied by attached Vault IDs, never inline agent fields.
+    config += 'data-binary = "' + _config_value(json.dumps(body, ensure_ascii=False, separators=(",", ":"))) + '"\n'
     args = _request_args("POST", BASE_URL + "/agents/sessions", stream=True)
-    args.extend(["-H", "Content-Type: application/json", "--data-binary", f"@{body_path}"])
+    args.extend(["-H", "Content-Type: application/json"])
     proc = None
     try:
         proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -318,8 +405,6 @@ def stream_initial_session(
             proc.terminate()
             proc.wait(timeout=5)
         raise
-    finally:
-        Path(body_path).unlink(missing_ok=True)
 
 
 def stream_followup_session(
@@ -333,7 +418,7 @@ def stream_followup_session(
     endpoint = f"/agents/sessions/{encoded_session_id}/events?stream=true"
     args = _request_args("GET", BASE_URL + endpoint, stream=True)
     # Include response headers so the server can wait until the SSE subscription is open.
-    args.insert(1, "--include")
+    args.insert(2, "--include")  # Keep --disable first so curl ignores ~/.curlrc.
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
     assert proc.stdin is not None and proc.stdout is not None
     proc.stdin.write(config)
@@ -350,6 +435,9 @@ def stream_followup_session(
                     except (IndexError, ValueError):
                         status_code = None
                 elif stripped == "" and status_code is not None:
+                    if 100 <= status_code < 200:
+                        status_code = None
+                        continue
                     if not 200 <= status_code < 300:
                         body = proc.stdout.read()
                         raise OpenAIRequestError(_error_text(body, "", status_code))
