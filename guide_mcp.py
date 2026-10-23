@@ -1,4 +1,4 @@
-"""Read-only Nova vector-store search, exposed as an MCP tool over stdio.
+"""Read-only Nova vector-store search, exposed over stdio or loopback HTTP.
 
 The hosted environment receives a Vault placeholder in NOVA_GUIDE_SEARCH_TOKEN.
 Curl sends it unchanged in the Authorization header; the OpenAI network proxy
@@ -8,6 +8,7 @@ substitutes the real credential only for api.openai.com. Never print the token.
 from __future__ import annotations
 
 import json
+import argparse
 import os
 import re
 import shutil
@@ -115,9 +116,23 @@ def main() -> None:
     # Lazy import keeps the one-time setup dependency-free on the user's laptop.
     from mcp.server.fastmcp import FastMCP
 
-    server = FastMCP("Nova guide search")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio")
+    args = parser.parse_args()
+    server = FastMCP("Nova guide search", host="127.0.0.1", port=8765,
+                     streamable_http_path="/mcp", stateless_http=True, json_response=True)
     server.tool(name="search_nova_guide", description=TOOL_DESCRIPTION)(search_nova_guide)
-    server.run(transport="stdio")
+    if args.transport == "streamable-http":
+        from starlette.responses import JSONResponse
+
+        @server.custom_route("/health", methods=["GET"])
+        async def health(request):
+            # Configuration presence only: never return a key or placeholder.
+            return JSONResponse({"service": "nova-guide-search", "transport": "http",
+                                 "search_configured": all(os.environ.get(name) for name in
+                                                          (TOKEN_VARIABLE, STORE_VARIABLE, PROJECT_VARIABLE))})
+
+    server.run(transport=args.transport)
 
 
 if __name__ == "__main__":

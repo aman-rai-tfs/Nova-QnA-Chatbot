@@ -1,15 +1,96 @@
 # Guide search inside an OpenAI-hosted session
 
+## Repair Platform Save: migrate the existing guide MCP to HTTP
+
+The Platform editor can add `request_metadata: {}` when saving a stdio MCP.
+The API rejects that combination with `mcp request_metadata requires an HTTP
+server`. Removing that field once does not prevent the editor from adding it
+again. The migration below changes guide MCP to HTTP inside each sandbox.
+It needs a one-time local setup command; subsequent guide and Jira requests
+still run through the bot or Platform session.
+
+The guide URL is `http://127.0.0.1:8765/mcp`, with
+`connection_origin: environment`. It refers to the session's sandbox, not your
+laptop. The server binds only to loopback. Atlassian keeps its remote HTTPS URL
+and `connection_origin: service`. Do not switch these origins in the editor.
+
+The new template **Nova guide MCP HTTP** contains `guide_mcp.py` and
+`start_guide_http.py` as inline base64 files. It installs curl, creates a Python
+virtual environment, installs `mcp==1.26.0`, then starts the HTTP server in the
+background and checks its health before setup finishes. The server inherits
+the Vault placeholder and the sandbox's proxy/certificate variables. It uses
+the same vector store, search implementation, eight-result maximum, and
+host-limited Vault search key. No new key or guide upload is needed.
+
+Keep your unsaved Platform draft open until this command passes. Put the
+generated agent JSON object (the content of curl's `-d`, without curl/shell
+escaping) in ignored `work/agent-unsaved-draft.json`. Keep credential IDs;
+remove actual key/token values. This preserves the draft's name, model,
+instructions and credential selection. The personal draft supplied in this
+chat has already been saved locally at that path; it is excluded from GitHub.
+
+Stop the local app with **Ctrl+C**, then run:
+
+```powershell
+Set-Location "$env:USERPROFILE\Documents\Nova-QnA-Chatbot"
+git pull origin main
+python .\migrate_guide_http.py --plan --draft-json .\work\agent-unsaved-draft.json --enable-jira-create
+python .\migrate_guide_http.py --apply --draft-json .\work\agent-unsaved-draft.json --enable-jira-create --run-app
+```
+
+The apply command reads your existing project key from `OPENAI_API_KEY`, or
+prompts for it without displaying it. It reuses the guide credential in Vault.
+It locates the draft Jira credential's Vault from resource metadata and includes
+both Vaults for API-created sessions. This requires Vault list/read permissions.
+It does not read or print stored secret values.
+
+Before changing the saved agent it creates a session with temporary agent
+overrides. Only guide search and Jira-site read tools are exposed during the
+checks. It requires a completed guide search containing source passages and,
+when Jira is configured, a completed live Jira-sites read. The saved agent and
+local default template stay unchanged if either check fails. New templates and
+verification sessions may have been created and their IDs are checkpointed.
+
+`--enable-jira-create` changes the copied draft's Jira policy to allow only
+new-issue creation after explicit approval of a complete draft. The allowlist
+contains Jira read tools plus `createJiraIssue`; Confluence writes, Jira edits,
+transitions/comments, and generic write/destructive tools are excluded. This
+flag does not grant Atlassian permissions or prove that the token has write
+scope. Actual Jira creation is not executed by the migration.
+
+After read checks pass, the helper saves the agent and checks an API
+retrieve/save round trip with HTTP metadata. It records the old agent definition
+and template ID in ignored `nova_state.json` for recovery. Existing sessions
+keep their original configuration. The original stdio helper refuses to
+overwrite an applied HTTP setup.
+
+If interrupted after a resource was checkpointed, retry the same apply command
+with `--resume`. The existing HTTP template is reused; a new read-only
+verification session is run. Keep the draft and script version unchanged.
+
+Only after PASS:
+
+1. Refresh the old agent draft page to load the preserved, migrated definition.
+2. Click **Save agent definition** once. This is the browser verification;
+   an API round trip alone does not establish that the UI preserved every field.
+3. Start a **new OpenAI-hosted** session with **Nova guide MCP HTTP**, matching
+   the template ID printed by migration. Attach **Nova guide search API access**
+   in API secrets and retain the saved Atlassian connection.
+4. Ask a guide question, then **Which Jira projects can I access?** Verify both
+   completed tool calls in the trace. In the local app click **New chat**.
+5. To prepare a ticket, describe the request to the bot. Review its complete
+   draft and confirm only when you want that real ticket created.
+
+The background server's lifetime and Vault configuration must pass the live
+hosted retrieval check. Preparation of these files alone is not a deployment
+or a passing Platform UI save check.
+
+## Original stdio setup (existing installations)
+
 This setup gives new sessions a `search_nova_guide` MCP tool that runs inside
 their OpenAI-hosted sandbox. It searches the existing OpenAI vector store. It
 does not upload the DOCX again, create another vector store, or use GitHub as a
 document source.
-
-Live guide retrieval passed on 23 October 2026 in session
-`sess_0672152a62823835006adb061326ec819c892fc288af05bb0d`. The MCP returned indexed
-source passages and the agent answered with section references. The verified
-template is `envtmpl_9a354d8d8c264027825dd0ed1843bcbdbae6c6f3db5642079b`.
-This verification did not test Jira writes or deploy the chatbot on NOVA.
 
 ## Why the earlier results differed
 
@@ -144,9 +225,8 @@ The first hosted retrieval attempt reached the guide MCP server but its curl
 request failed with status 7. The stdio process originally inherited only its
 three guide variables. The revised MCP configuration also inherits the
 sandbox's proxy and certificate environment variables, and connection errors
-report their presence plus a sanitized curl diagnostic. Live retrieval passed
-after this networking repair. A failed retrieval is an operational error and
-does not establish that the document lacks the requested information.
+report their presence plus a sanitized curl diagnostic. This is a networking
+repair to verify live, rather than evidence that the document lacks the answer.
 
 If the process stopped before the credential was checkpointed, the helper may
 ask for the same restricted search key again. Checkpointed resource-creation
