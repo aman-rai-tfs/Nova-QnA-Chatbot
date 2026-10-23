@@ -8,7 +8,7 @@ A small, runnable web chat app grounded only in the Nova Deployment Guide. It sa
 - `app.py` is a dependency-free Python HTTP app for chat, health checks, and streamed session events.
 - `openai_http.py` calls the OpenAI HTTP API through `curl` / `curl.exe`; it contains no credentials.
 - `runtime_logging.py` provides console logs, request correlation, event/tool statistics, timing, and optional rotating log files.
-- `guide_mcp.py`, `start_guide_http.py`, and `migrate_guide_http.py` provide guide search over HTTP inside an OpenAI-hosted sandbox. The original `setup_guide_mcp.py` provisions the legacy stdio setup. See [hosted guide MCP setup](HOSTED_GUIDE_MCP.md) for commands and credential configuration.
+- `guide_mcp.py` and `start_guide_http.py` provide guide search over HTTP inside an OpenAI-hosted sandbox. `setup_guide_plugin.py` packages its MCP connection into the environment, avoiding the Platform editor's unsupported metadata on explicit environment MCP entries. `migrate_guide_http.py` provisions the explicit HTTP entry; `setup_guide_mcp.py` provisions legacy stdio. See [hosted guide MCP setup](HOSTED_GUIDE_MCP.md) for commands and credential configuration.
 - `index.html` is the browser chat UI.
 - `Dockerfile` packages the runtime for a container-based platform such as NOVA.
 

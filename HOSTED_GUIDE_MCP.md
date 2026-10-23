@@ -1,6 +1,69 @@
 # Guide search inside an OpenAI-hosted session
 
-## Repair Platform Save: migrate the existing guide MCP to HTTP
+## Platform editor route: register the guide MCP through its environment plugin
+
+On 23 October 2026, a real edit and Save in the Platform editor reproduced
+`mcp request_metadata requires a service-origin HTTP server`, even after guide
+MCP was changed to environment-origin HTTP. The generated form included the
+unsupported empty metadata map. The temporary name edit was restored. An API
+save workaround therefore did not satisfy the requirement for colleagues to
+edit and save the agent directly in the Platform UI.
+
+The documented environment-plugin mechanism allows the MCP connection to be
+registered in the hosted template instead of the agent form. The prepared
+`setup_guide_plugin.py` uses this mechanism. Its live retrieval and browser-save
+checks must pass before treating this route as verified.
+
+The template **Nova guide MCP plugin** contains the same two Python files,
+dependencies, proxy settings, guide store IDs, and startup command as the working
+HTTP environment. It also contains a small inline ZIP with:
+
+```text
+nova-guide-search/
+  .codex-plugin/plugin.json
+  .mcp.json
+```
+
+The manifest registers `.mcp.json`, whose single server points to the guide's
+loopback HTTP endpoint. No secret or document text is included in the plugin.
+OpenAI extracts and registers it for each fresh environment. The existing
+restricted search key remains in Vault and is attached as the guide API secret.
+
+Run from the existing repository, retaining `nova_state.json`:
+
+```powershell
+Set-Location "$env:USERPROFILE\Documents\Nova-QnA-Chatbot"
+python .\setup_guide_plugin.py --plan
+python .\setup_guide_plugin.py --apply --run-app
+```
+
+The apply command uses the existing OpenAI project key or a hidden prompt. It
+first creates a session with temporary overrides that expose no Jira write
+tools. It requires source passages from the plugin's guide MCP and a successful
+Jira-sites read before changing the saved agent. It then removes only the
+explicit guide tool entry, preserving the current saved instructions, model,
+Jira credential, and Jira tool permissions. All other agent settings remain
+intact. The helper strips response-only null concurrency limits from API saves.
+
+Only after PASS, refresh the Platform agent page and verify an edit/save/reload.
+The agent form should show **Atlassian** as its explicit MCP connection. The
+guide MCP remains available through **Nova guide MCP plugin** when starting a
+new hosted session. Attach **Nova guide search API access** in API secrets.
+Colleagues should select the exact template ID printed by setup. They do not
+need the local web app or a running laptop to use the hosted session.
+
+The local app reads the new default template and all relevant Vault IDs from
+`nova_state.json`; click **New chat** after restarting it. Explicit environment
+overrides still take precedence. Old sessions retain their previous setup.
+
+If setup fails after checkpointing resources, retry with `--resume`. A failed
+read check leaves the saved agent's guide entry intact. Previous agent settings
+and the template ID are retained in ignored state for recovery. Do not rerun
+the older stdio/explicit HTTP setup after applying the plugin route.
+
+Reference: [Plugins in Agents API environments](https://developers.openai.com/api/docs/guides/agents-api/tools/plugins).
+
+## Explicit HTTP entry (intermediate migration; UI Save still fails)
 
 The Platform editor can add `request_metadata: {}` when saving a stdio MCP.
 The API rejects that combination with `mcp request_metadata requires an HTTP

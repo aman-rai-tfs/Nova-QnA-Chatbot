@@ -76,6 +76,12 @@ def agent_fields(value: dict) -> dict:
     if not isinstance(value, dict):
         raise ValueError("Agent configuration must be a JSON object.")
     result = {key: copy.deepcopy(value[key]) for key in FIELDS if key in value}
+    multi_agent = result.get("multi_agent")
+    if isinstance(multi_agent, dict):
+        # Responses report a null concurrency limit when delegation is disabled;
+        # update requests accept an omitted limit or a positive integer, not null.
+        if not multi_agent.get("enabled") or multi_agent.get("max_concurrent_subagents") is None:
+            multi_agent.pop("max_concurrent_subagents", None)
     if not isinstance(result.get("tools"), list) or not isinstance(result.get("instructions"), str):
         raise ValueError("Agent configuration needs a tools list and text instructions.")
     # Only reference IDs belong in the recovery file. Reject inline secrets.
@@ -248,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     state = setup.read_state()
     guide = state.get("hosted_guide_mcp", {})
+    if guide.get("transport") == "plugin_http":
+        raise ValueError("This agent uses the environment plugin. Use setup_guide_plugin.py rather than restoring the explicit guide entry.")
     agent_id = setup.validate_id(state.get("agent_id") or guide.get("agent_id"), "agent_")
     store_id = setup.validate_id(guide.get("vector_store_id") or state.get("vector_store_id"), "vs_")
     project_id = setup.validate_id(guide.get("project_id") or state.get("project_id"), "proj_")

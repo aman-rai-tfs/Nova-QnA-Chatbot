@@ -206,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.refresh_template and not args.resume:
         parser.error("--refresh-template requires --resume.")
     state = read_state()
-    if state.get("hosted_guide_mcp", {}).get("transport") == "http":
+    if state.get("hosted_guide_mcp", {}).get("transport") in ("http", "plugin_http"):
         raise ValueError("This agent uses HTTP guide MCP. Use migrate_guide_http.py rather than reverting it to stdio.")
     agent_id = validate_id(args.agent_id or state.get("agent_id") or DEFAULT_AGENT, "agent_")
     store_id = validate_id(args.vector_store_id or state.get("vector_store_id", ""), "vs_")
