@@ -7,6 +7,7 @@ A small, runnable web chat app grounded only in the Nova Deployment Guide. It sa
 - `provision.py` uploads and indexes the source DOCX, creates the reusable **Nova Deployment Guide Assistant**, then starts a session with an initial user message and prints the streamed events.
 - `app.py` is a dependency-free Python HTTP app for chat, health checks, and streamed session events.
 - `openai_http.py` calls the OpenAI HTTP API through `curl` / `curl.exe`; it contains no credentials.
+- `runtime_logging.py` provides console logs, request correlation, event/tool statistics, timing, and optional rotating log files.
 - `guide_mcp.py` and `setup_guide_mcp.py` provide guide search inside an OpenAI-hosted sandbox; see [hosted guide MCP setup](HOSTED_GUIDE_MCP.md) for complete commands and credential configuration.
 - `index.html` is the browser chat UI.
 - `Dockerfile` packages the runtime for a container-based platform such as NOVA.
@@ -50,11 +51,86 @@ Open [http://localhost:8080](http://localhost:8080). The first message creates a
 
 If running the web app elsewhere, set `OPENAI_API_KEY`, `OPENAI_PROJECT_ID`, `OPENAI_AGENT_ID`, and `OPENAI_VECTOR_STORE_ID` in that process’s environment. The project ID defaults to the Nova project above. `PORT` defaults to `8080`; `HOST` defaults to `0.0.0.0`. The health endpoint is `GET /api/health`.
 
+## See backend progress in PowerShell
+
+The app prints timestamped logs to PowerShell by default. Stop the old process
+with **Ctrl+C**, update the code, then start it again in the window containing
+your existing `OPENAI_API_KEY`:
+
+```powershell
+Set-Location "$env:USERPROFILE\Documents\Nova-QnA-Chatbot"
+git pull origin main
+python .\app.py
+```
+
+No guide re-upload, OAuth sign-in, or hosted environment refresh is needed for
+this logging change. Click **New chat** when you want a session using the latest
+saved agent configuration. Logs are produced by this running web app; questions
+sent directly on the OpenAI Platform do not pass through your local PowerShell.
+
+Each accepted request gets a `request_id`; session and turn IDs are added as
+OpenAI returns them. The response includes `X-Request-ID` for troubleshooting.
+Interleaved requests can be followed using that ID.
+
+| Log step | Information recorded |
+| --- | --- |
+| `server.started`, `server.configuration` | Address, project/agent/vector-store IDs, template ID, Vault count, whether the app key is configured |
+| `request.received`, `request.validated` | Request ID, route, request size, message character count, new/existing session, selected configuration |
+| `session.creating`, `session.created` | Agent and session association, environment choice, credential Vault count |
+| `environment.wait_started`, `environment.state`, `environment.ready` | Provisioning state, time waiting, configured timeout, environment ID |
+| `api.request_started`, `api.request_finished`, `api.request_failed` | HTTP method/endpoint, status when returned by curl, response bytes, curl exit code, duration; polling GET details require DEBUG |
+| `stream.connecting`, `stream.connected`, `input.submitting`, `input.accepted` | Stream connection time, HTTP status, OpenAI request ID when provided, input submission/acceptance |
+| `turn.state`, `tool.started`, `tool.finished` | Turn lifecycle, tool name/server/item ID, tool status, observed duration when both events arrive, reported failures |
+| Guide tool result | Returned passage count, passage character count, score range, result characters/UTF-8 bytes, when present in the streamed result |
+| `response.first_text` | Time from receipt of the browser request to its first text event; this includes setup and tool waits |
+| `turn.finished` | Completion/failure/cancellation, provider duration when timestamps exist, input/output/total/cached/reasoning tokens when reported |
+| `request.progress` | Every 15 seconds: current phase, elapsed time, time since last event, event/tool/output counts |
+| `request.finished` | Request outcome, HTTP status, total elapsed time, first-text time, output character count, event/tool/failure counts, unfinished items |
+| Errors and shutdown | Validation errors, stream/API failures, client disconnects, unexpected error type, clean Ctrl+C shutdown |
+
+For the older application function path, `function.executing`,
+`guide.search_started`, `guide.search_finished`, and `function.result_submitted`
+also describe local guide execution. `tool.arguments_ready` means the model has
+finished constructing a function call; execution is logged separately.
+
+Enable additional metadata, including polling HTTP calls and output-item
+lifecycle, and optionally save the same logs to a rotating file:
+
+```powershell
+$env:NOVA_LOG_LEVEL = "DEBUG"
+$env:NOVA_LOG_FILE = ".\logs\nova-chatbot.log"
+$env:NOVA_LOG_PROGRESS_SECONDS = "15"
+python .\app.py
+```
+
+Supported levels: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`. Set progress
+seconds to `0` to disable periodic progress. Console logs are immediate; optional
+UTF-8 files rotate at 5 MiB with three backups. `logs/` and `*.log*` are excluded
+from Git and the container build context. File logging is off by default.
+For NOVA, console output can be collected by the platform's container logging.
+
+Logs record metadata rather than user questions, generated answers, tool
+arguments, guide passages, Jira records, HTTP bodies/headers, or reasoning text.
+Known runtime secrets and authorization strings are redacted as an additional
+precaution. DEBUG does not enable payload logging. Diagnostic error summaries
+are sanitized and bounded; unknown/non-JSON response bodies are omitted.
+
+Durations named `observed_duration_ms` are measured between received stream
+events and can include argument generation, scheduling, execution, and network
+delivery; they are not exact provider trace-span timings. A completed turn can
+contain failed tools, so read `tool_failures` and individual tool outcomes.
+Missing token usage is logged as `usage_available=false`, never zero. Recorded
+usage is best-effort and can arrive later; cached tokens are included in input
+tokens and reasoning tokens in output tokens. There is no extra usage polling
+or API call solely for logging. See the
+[OpenAI observability guide](https://developers.openai.com/api/docs/guides/agents-api/observability)
+for accounting details.
+
 ## Use an existing agent with an authenticated MCP connection
 
 After saving MCP tools or instructions on the Platform, click **New chat** in the local app. A browser refresh continues the previous session and its original configuration. Keep the local app pointed at the same saved agent with `OPENAI_AGENT_ID`.
 
-For MCP servers using Bearer or OAuth credentials, the Platform attaches an agent's saved MCP connections when it creates a session. API clients must explicitly attach the vault containing the MCP credential. In **Agents > Vault**, copy the **Vault ID** for the saved connection. A `vault_` ID is a resource reference, not the token itself; a `credential_` ID does not replace it. For this agent's hosted Atlassian connection, use the OAuth setup below. The personal-token diagnostic is a separate direct discovery check.
+For MCP servers using Bearer or OAuth credentials, the Platform attaches an agent's saved MCP connections when it creates a session. API clients must explicitly attach the vault containing the MCP credential. In **Agents > Vault**, copy the **Vault ID** for the saved connection. A `vault_` ID is a resource reference, not the token itself; a `credential_` ID does not replace it. Atlassian personal API tokens require Basic authentication; follow the next section for those tokens.
 
 Stop the existing local server with Ctrl+C, then run these commands in the same PowerShell window where `OPENAI_API_KEY` is already set. Replace the placeholder with the Vault ID displayed in your project:
 
@@ -102,7 +178,7 @@ Subsequent Platform sessions use the saved OAuth connection. Subsequent local ru
 
 The existing `env` hosted template above produced a successful native `getAccessibleAtlassianResources` call in Platform session `sess_0cac073205b63b84006ada316eb92881989ed83a9e53c5f6e0`. The earlier OAuth test with no sandbox failed before generation with a generic internal error. The helper saves `environment_template_id` locally; the app uses it for new sessions. `OPENAI_ENVIRONMENT_TEMPLATE_ID` can override it, and `/api/health` reports `environment_type`. Use the hosted template when testing this integration. The template must exist in the selected project; these IDs belong to this Nova project.
 
-The first API test with the hosted template and initial input in the create request also failed before generation, although its environment later showed Connected. Hosted startup now follows the observed successful Platform sequence: create the session without input, poll the environment until Connected (up to five minutes), open the event stream, then submit the first message separately. The helper prints the session ID and environment states while waiting. It does not submit input after a startup failure or timeout, and it does not automatically retry a submitted message. The original combined-create flow remains available for sessions without a sandbox. The guide MCP verification on 23 October 2026 completed through this API startup flow and returned source passages; that check did not retest Jira access.
+The first API test with the hosted template and initial input in the create request also failed before generation, although its environment later showed Connected. Hosted startup now follows the observed successful Platform sequence: create the session without input, poll the environment until Connected (up to five minutes), open the event stream, then submit the first message separately. The helper prints the session ID and environment states while waiting. It does not submit input after a startup failure or timeout, and it does not automatically retry a submitted message. The original combined-create flow remains available for sessions without a sandbox. This change still needs a live API result to establish that it resolves the app-created session failure.
 
 ## Check Atlassian MCP directly
 

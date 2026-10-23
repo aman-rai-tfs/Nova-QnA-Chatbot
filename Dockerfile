@@ -11,7 +11,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --create-home novaapp
 
 WORKDIR /app
-COPY --chown=novaapp:novaapp app.py openai_http.py index.html ./
+COPY --chown=novaapp:novaapp app.py openai_http.py runtime_logging.py index.html ./
 USER novaapp
 
 EXPOSE 8080

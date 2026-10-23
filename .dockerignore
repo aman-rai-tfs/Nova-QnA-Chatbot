@@ -8,3 +8,6 @@ assets/
 work/
 __pycache__/
 *.py[cod]
+logs/
+*.log
+*.log.*

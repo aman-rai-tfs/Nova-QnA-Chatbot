@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import quote
 from uuid import uuid4
+from runtime_logging import bind_context, error_fields, log_event, register_log_secrets, tool_result_fields
 
 BASE_URL = "https://api.openai.com/v1"
 DEFAULT_PROJECT_ID = "proj_dXDjYYmzfErZmSza7mHcNP0y"
@@ -57,6 +58,7 @@ def _redact_runtime_secrets(value: str) -> str:
 def register_runtime_secrets(*values: str) -> None:
     """Redact short-lived OAuth secrets from diagnostics without writing them."""
     _extra_runtime_secrets.extend(value for value in values if isinstance(value, str) and value)
+    register_log_secrets(*values)
 
 
 def _safe_event(value):
@@ -112,23 +114,52 @@ def request_json(
 ) -> dict:
     config = _config_stdin()
     args = _request_args(method, BASE_URL + endpoint)
+    status_marker = "\n__NOVA_HTTP_STATUS__:"
+    args.extend(["--write-out", status_marker + "%{http_code}"])
     if extra_headers:
         for header in extra_headers:
             args.extend(["-H", header])
     if payload is not None:
         args.extend(["-H", "Content-Type: application/json"])
         config += 'data-binary = "' + _config_value(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) + '"\n'
-    result = subprocess.run(args, input=config, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    started = time.monotonic()
+    log_level = "DEBUG" if method == "GET" else "INFO"
+    path = endpoint.split("?", 1)[0]
+    log_event("api.request_started", level=log_level, method=method, endpoint=path)
+    try:
+        result = subprocess.run(args, input=config, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log_event("api.request_failed", level="ERROR", method=method, endpoint=path,
+                  duration_ms=round((time.monotonic() - started) * 1000), error_type=type(exc).__name__)
+        raise
+    response = result.stdout
+    body, marker, status = response.rpartition(status_marker)
+    http_status = int(status.strip()) if marker and status.strip().isdigit() else None
+    if http_status is not None:
+        response = body
+    details = {"method": method, "endpoint": path, "http_status": http_status,
+               "duration_ms": round((time.monotonic() - started) * 1000),
+               "response_bytes": len(response.encode("utf-8")), "curl_exit": result.returncode}
     if result.returncode:
-        raise OpenAIRequestError(_error_text(result.stdout, result.stderr, result.returncode))
-    if allow_empty_response and not result.stdout.strip():
+        api_error = {}
+        try:
+            parsed_error = json.loads(response)
+            if isinstance(parsed_error, dict) and isinstance(parsed_error.get("error"), dict):
+                api_error = parsed_error["error"]
+        except (ValueError, RecursionError):
+            pass
+        log_event("api.request_failed", level="ERROR", **details, **error_fields(api_error))
+        raise OpenAIRequestError(_error_text(response, result.stderr, result.returncode))
+    log_event("api.request_finished", level=log_level, **details)
+    if allow_empty_response and not response.strip():
         # The Agents session events endpoint acknowledges accepted events with HTTP 202,
         # which may have no response body. curl's exit status already verifies success.
         return {}
     try:
-        parsed = json.loads(result.stdout)
+        parsed = json.loads(response)
     except json.JSONDecodeError as exc:
-        raise OpenAIRequestError("OpenAI returned a non-JSON response: " + _redact_runtime_secrets(result.stdout[:800])) from exc
+        log_event("api.invalid_response", level="ERROR", method=method, endpoint=path, http_status=http_status)
+        raise OpenAIRequestError("OpenAI returned a non-JSON response: " + _redact_runtime_secrets(response[:800])) from exc
     if not isinstance(parsed, dict):
         raise OpenAIRequestError("OpenAI returned an unexpected response shape.")
     return parsed
@@ -189,6 +220,8 @@ def session_id_from_event(payload: object) -> str | None:
 
 def search_nova_guide(vector_store_id: str, query: str) -> dict:
     """Search the guide vector store for text to return through the Agents function tool."""
+    started = time.monotonic()
+    log_event("guide.search_started", vector_store_id=vector_store_id, query_chars=len(query), max_results=8)
     result = request_json(
         "POST",
         f"/vector_stores/{quote(vector_store_id, safe='')}/search",
@@ -207,7 +240,10 @@ def search_nova_guide(vector_store_id: str, query: str) -> dict:
                 "score": item.get("score"),
                 "text": text[:12000],
             })
-    return {"query": query, "matches": matches}
+    output = {"query": query, "matches": matches}
+    log_event("guide.search_finished", duration_ms=round((time.monotonic() - started) * 1000),
+              **tool_result_fields(output))
+    return output
 
 
 def handle_required_actions(payload: dict, vector_store_id: str) -> None:
@@ -224,6 +260,9 @@ def handle_required_actions(payload: dict, vector_store_id: str) -> None:
         turn_id, call_id = action.get("turn_id"), action.get("call_id")
         if not isinstance(turn_id, str) or not isinstance(call_id, str):
             raise OpenAIRequestError("The session returned a function call without its turn or call ID.")
+        started = time.monotonic()
+        log_event("function.executing", session_id=session_id, turn_id=turn_id,
+                  call_id=call_id, tool=action.get("name"))
         outcome: dict
         if action.get("name") != "search_nova_guide":
             outcome = {"success": False, "error": f"Unsupported function: {action.get('name', '')}"}
@@ -254,6 +293,9 @@ def handle_required_actions(payload: dict, vector_store_id: str) -> None:
             extra_headers=["Idempotency-Key: " + uuid4().hex],
             allow_empty_response=True,
         )
+        log_event("function.result_submitted", level="INFO" if outcome.get("success") else "WARNING",
+                  session_id=session_id, turn_id=turn_id, call_id=call_id, tool=action.get("name"),
+                  success=outcome.get("success", False), duration_ms=round((time.monotonic() - started) * 1000))
 
 
 def _read_event_stream(stdout, on_event: Callable[[str, dict], None]) -> None:
@@ -302,6 +344,8 @@ def _wait_for_hosted_environment(session: dict, on_event: Callable[[str, dict], 
     """Wait for provisioning before submitting the first model turn."""
     session_id = session["id"]
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    log_event("environment.wait_started", session_id=session_id, timeout_seconds=timeout)
     last_status = None
     while True:
         if session.get("status") == "failed":
@@ -317,6 +361,8 @@ def _wait_for_hosted_environment(session: dict, on_event: Callable[[str, dict], 
             on_event("app.environment", {"type": "app.environment", "session_id": session_id, "status": status})
             last_status = status
         if status == "connected":
+            log_event("environment.ready", session_id=session_id, environment_id=environment_id,
+                      duration_ms=round((time.monotonic() - started) * 1000))
             return
         if status in ("failed", "expired"):
             raise OpenAIRequestError("The hosted environment could not start (" + status + "). Session: " + session_id)
@@ -335,6 +381,8 @@ def stream_initial_session(
     vault_ids: list[str] | None = None,
     environment: dict | None = None,
 ) -> str:
+    log_event("session.creating", agent_id=agent_id, environment_type=(environment or {}).get("type", "none"),
+              environment_template_id=(environment or {}).get("environment_template_id"), vault_count=len(vault_ids or []))
     if environment and environment.get("type") == "openai_hosted":
         # Match the Platform UI: create an idle session, wait for provisioning,
         # subscribe to events, then submit the initial user message separately.
@@ -345,6 +393,7 @@ def stream_initial_session(
         session_id = session.get("id")
         if not isinstance(session_id, str) or not session_id.startswith("sess_"):
             raise OpenAIRequestError("OpenAI did not return a hosted session ID.")
+        bind_context(session_id=session_id)
         on_event("app.session", {"type": "app.session", "session_id": session_id})
         _wait_for_hosted_environment(session, on_event)
         stream_followup_session(session_id, message, on_event, vector_store_id)
@@ -363,6 +412,8 @@ def stream_initial_session(
     args = _request_args("POST", BASE_URL + "/agents/sessions", stream=True)
     args.extend(["-H", "Content-Type: application/json"])
     proc = None
+    started = time.monotonic()
+    log_event("stream.connecting", method="POST", endpoint="/agents/sessions")
     try:
         proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
         assert proc.stdin is not None and proc.stdout is not None
@@ -399,6 +450,8 @@ def stream_initial_session(
             raise OpenAIRequestError("The session stream ended without a session ID. Check the OpenAI response and try again.")
         if not completed:
             raise OpenAIRequestError("The session stream closed before the agent turn completed. Retrieve the session before retrying.")
+        log_event("stream.finished", session_id=found_session, turn_completed=True,
+                  observed_duration_ms=round((time.monotonic() - started) * 1000))
         return found_session
     except BaseException:
         if proc is not None and proc.poll() is None:
@@ -413,36 +466,48 @@ def stream_followup_session(
     on_event: Callable[[str, dict], None],
     vector_store_id: str,
 ) -> None:
+    bind_context(session_id=session_id)
     config = _config_stdin()
     encoded_session_id = quote(session_id, safe="")
     endpoint = f"/agents/sessions/{encoded_session_id}/events?stream=true"
     args = _request_args("GET", BASE_URL + endpoint, stream=True)
     # Include response headers so the server can wait until the SSE subscription is open.
     args.insert(2, "--include")  # Keep --disable first so curl ignores ~/.curlrc.
+    started = time.monotonic()
+    log_event("stream.connecting", method="GET", session_id=session_id)
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
     assert proc.stdin is not None and proc.stdout is not None
     proc.stdin.write(config)
     proc.stdin.close()
     status_code: int | None = None
+    openai_request_id = None
     header_mode = True
     try:
         for line in proc.stdout:
             if header_mode:
                 stripped = line.rstrip("\r\n")
                 if stripped.startswith("HTTP/"):
+                    openai_request_id = None
                     try:
                         status_code = int(stripped.split()[1])
                     except (IndexError, ValueError):
                         status_code = None
+                elif stripped.lower().startswith("x-request-id:"):
+                    openai_request_id = stripped.split(":", 1)[1].strip()
                 elif stripped == "" and status_code is not None:
                     if 100 <= status_code < 200:
                         status_code = None
                         continue
                     if not 200 <= status_code < 300:
+                        log_event("stream.rejected", level="ERROR", http_status=status_code,
+                                  openai_request_id=openai_request_id)
                         body = proc.stdout.read()
                         raise OpenAIRequestError(_error_text(body, "", status_code))
                     header_mode = False
+                    log_event("stream.connected", http_status=status_code, openai_request_id=openai_request_id,
+                              connect_ms=round((time.monotonic() - started) * 1000))
                     # The SSE subscription is now open; post input to begin this turn.
+                    log_event("input.submitting", message_chars=len(message))
                     request_json(
                         "POST",
                         f"/agents/sessions/{encoded_session_id}/events",
@@ -450,6 +515,7 @@ def stream_followup_session(
                         extra_headers=["Idempotency-Key: " + uuid4().hex],
                         allow_empty_response=True,
                     )
+                    log_event("input.accepted")
                     break
                 continue
         if header_mode:
@@ -485,6 +551,8 @@ def stream_followup_session(
             raise OpenAIRequestError(_error_text("", stderr, code))
         if not completed:
             raise OpenAIRequestError("The session event stream closed before the agent turn completed.")
+        log_event("stream.finished", turn_completed=True,
+                  observed_duration_ms=round((time.monotonic() - started) * 1000))
     finally:
         if proc.poll() is None:
             proc.terminate()

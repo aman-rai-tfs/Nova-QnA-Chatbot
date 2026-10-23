@@ -6,11 +6,13 @@ import argparse
 import json
 import os
 import re
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
+from uuid import uuid4
 from openai_http import DEFAULT_PROJECT_ID, OpenAIRequestError, session_id_from_event, stream_followup_session, stream_initial_session
+from runtime_logging import RequestMetrics, bind_context, configure_logging, error_fields, log_context, log_event
 
 ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "nova_state.json"
@@ -97,9 +99,9 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args) -> None:
-        # Keep the built-in server logs concise and avoid logging request bodies.
-        sys.stdout.write(f"{self.log_date_time_string()} {self.address_string()} {format % args}\n")
-        sys.stdout.flush()
+        # The request line can contain query parameters; log only the URL path.
+        log_event("http.access", method=self.command, path=urlsplit(self.path).path,
+                  status=args[1] if len(args) > 1 else None)
 
     def do_GET(self) -> None:
         if self.path == "/api/health":
@@ -135,6 +137,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_POST(self) -> None:
+        with log_context(request_id=uuid4().hex[:12]):
+            self._request_metrics = RequestMetrics()
+            self._request_outcome = "rejected"
+            self._http_status = None
+            log_event("request.received", method=self.command, path=urlsplit(self.path).path)
+            try:
+                self._handle_post()
+            except (BrokenPipeError, ConnectionResetError):
+                self._request_outcome = "client_disconnected"
+                log_event("client.disconnected", level="WARNING")
+            except Exception as exc:
+                self._request_outcome = "failed"
+                log_event("request.unexpected_error", level="ERROR", **error_fields(exc))
+                # Avoid BaseHTTPRequestHandler printing an unsanitized traceback.
+                if self._http_status is None:
+                    self._json_response(500, {"error": "An unexpected server error occurred. Check the request ID in the server logs."})
+                elif self._http_status == 200:
+                    try:
+                        event = {"event_type": "error", "event": {"type": "error", "error": {
+                            "message": "An unexpected server error occurred. Request ID: " + self._request_metrics.context["request_id"]}}}
+                        self.wfile.write(("event: agent\ndata: " + json.dumps(event) + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+            finally:
+                self._request_metrics.finish(self._request_outcome, self._http_status)
+                del self._request_metrics
+
+    def _handle_post(self) -> None:
         if self.path != "/api/chat":
             self._json_response(404, {"error": "Not found"})
             return
@@ -184,7 +215,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "Invalid session ID."})
             return
 
+        bind_context(session_id=session_id)
+        self._request_metrics.context = {**self._request_metrics.context, **({"session_id": session_id} if session_id else {})}
+        self._request_metrics.phase = "continuing_session" if session_id else "creating_session"
+        log_event("request.validated", message_chars=len(message.strip()), request_bytes=length,
+                  session_mode="existing" if session_id else "new", agent_id=current_agent,
+                  vector_store_id=current_vector_store, vault_count=len(current_vaults),
+                  environment_type=current_environment["type"],
+                  environment_template_id=current_environment.get("environment_template_id"))
+        self._request_metrics.start_progress()
+
+        self._http_status = 200
         self.send_response(200)
+        self.send_header("X-Request-ID", self._request_metrics.context["request_id"])
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-transform")
         self.send_header("X-Accel-Buffering", "no")
@@ -193,6 +236,7 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         def relay(event_type: str, payload: dict) -> None:
+            self._request_metrics.observe(event_type, payload)
             envelope = {"event_type": event_type, "event": payload}
             resolved_session = session_id_from_event(payload) or session_id
             if resolved_session:
@@ -204,6 +248,8 @@ class Handler(BaseHTTPRequestHandler):
             if session_id:
                 lock = session_lock(session_id)
                 if not lock.acquire(blocking=False):
+                    self._request_outcome = "session_busy"
+                    log_event("session.busy", level="WARNING")
                     relay("error", {"type": "error", "error": {"message": "A response is already in progress for this session."}})
                     return
                 try:
@@ -218,7 +264,10 @@ class Handler(BaseHTTPRequestHandler):
                 relay("app.session", {"type": "app.session", "session_id": new_session})
             self.wfile.write(b"event: done\ndata: {}\n\n")
             self.wfile.flush()
+            self._request_outcome = "completed"
         except (OpenAIRequestError, OSError, BrokenPipeError) as exc:
+            self._request_outcome = "client_disconnected" if isinstance(exc, (BrokenPipeError, ConnectionResetError)) else "failed"
+            log_event("request.failed", level="ERROR", **error_fields(exc))
             try:
                 error = {"type": "error", "error": {"message": str(exc)}}
                 relay("error", error)
@@ -226,9 +275,16 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _json_response(self, status: int, payload: dict) -> None:
+        self._http_status = status
+        if status >= 400:
+            log_event("request.rejected", level="WARNING", status=status,
+                      reason=payload.get("error") if isinstance(payload.get("error"), str) else "request_failed")
         content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        metrics = getattr(self, "_request_metrics", None)
+        if metrics:
+            self.send_header("X-Request-ID", metrics.context["request_id"])
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -236,16 +292,39 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main(argv: list[str] | None = None) -> None:
+    configure_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--atlassian-mcp", action="store_true", help="Retired inline-Basic mode; use setup_atlassian_oauth.py, then run app.py normally.")
     args = parser.parse_args(argv)
     if args.atlassian_mcp:
         parser.error("The API rejected inline MCP Basic authorization. Run python .\\setup_atlassian_oauth.py to configure OAuth in OpenAI Vault, then start python .\\app.py normally.")
     host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8080"))
-    server = ThreadingHTTPServer((host, port), Handler)
-    print(f"Nova Guide Assistant listening on http://{host}:{port}", flush=True)
-    server.serve_forever()
+    try:
+        port = int(os.environ.get("PORT", "8080"))
+        if not 1 <= port <= 65535:
+            raise ValueError("PORT must be between 1 and 65535.")
+        server = ThreadingHTTPServer((host, port), Handler)
+    except (ValueError, OSError) as exc:
+        log_event("server.start_failed", level="ERROR", host=host, **error_fields(exc))
+        raise SystemExit(1) from None
+    log_event("server.started", listen_url=f"http://{host}:{port}", browser_url=f"http://localhost:{port}",
+              project_id=os.environ.get("OPENAI_PROJECT_ID", DEFAULT_PROJECT_ID),
+              agent_id=agent_id(), api_key_configured=bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+              log_level=os.environ.get("NOVA_LOG_LEVEL", "INFO"))
+    try:
+        configured_environment = session_environment()
+        log_event("server.configuration", environment_type=configured_environment["type"],
+                  environment_template_id=configured_environment.get("environment_template_id"),
+                  vault_count=len(agent_vault_ids()), vector_store_id=guide_vector_store_id())
+    except OpenAIRequestError as exc:
+        log_event("server.configuration_error", level="ERROR", **error_fields(exc))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log_event("server.stopping", reason="keyboard_interrupt")
+    finally:
+        server.server_close()
+        log_event("server.stopped")
 
 
 if __name__ == "__main__":
